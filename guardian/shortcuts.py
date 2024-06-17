@@ -136,9 +136,9 @@ def assign_perm(perm, user_or_group, obj=None):
 
 
 def assign(perm, user_or_group, obj=None):
-    """ Depreciated function name left in for compatibility"""
+    """ Deprecated function name left in for compatibility"""
     warnings.warn(
-        "Shortcut function 'assign' is being renamed to 'assign_perm'. Update your code accordingly as old name will be depreciated in 2.0 version.",
+        "Shortcut function 'assign' is being renamed to 'assign_perm'. Update your code accordingly as old name will be deprecated in 2.0 version.",
         DeprecationWarning)
     return assign_perm(perm, user_or_group, obj)
 
@@ -336,7 +336,7 @@ def get_users_with_perms(obj, attach_perms=False, with_superusers=False,
         return users
 
 
-def get_groups_with_perms(obj, attach_perms=False):
+def get_groups_with_perms(obj, attach_perms=False, only_with_perms_in=None):
     """
     Returns queryset of all ``Group`` objects with *any* object permissions for
     the given ``obj``.
@@ -346,6 +346,10 @@ def get_groups_with_perms(obj, attach_perms=False):
     :param attach_perms: Default: ``False``. If set to ``True`` result would be
       dictionary of ``Group`` instances with permissions' codenames list as
       values. This would fetch groups eagerly!
+
+    :param only_with_perms_in: Default: ``None``. If set to an iterable of
+      permission strings then only groups with those permissions would be
+      returned.
 
     Example::
 
@@ -377,10 +381,15 @@ def get_groups_with_perms(obj, attach_perms=False):
             }
         else:
             group_filters = {'%s__content_object' % group_rel_name: obj}
+        if only_with_perms_in is not None:
+            permission_ids = Permission.objects.filter(content_type=ctype, codename__in=only_with_perms_in).values_list('id', flat=True)
+            group_filters.update({
+                '%s__permission_id__in' % group_rel_name: permission_ids,
+            })
         return Group.objects.filter(**group_filters).distinct()
     else:
         group_perms_mapping = defaultdict(list)
-        groups_with_perms = get_groups_with_perms(obj)
+        groups_with_perms = get_groups_with_perms(obj, only_with_perms_in=only_with_perms_in)
         qs = group_model.objects.filter(group__in=groups_with_perms).prefetch_related('group', 'permission')
         if group_model is GroupObjectPermission:
             qs = qs.filter(object_pk=obj.pk, content_type=ctype)
@@ -530,7 +539,7 @@ def get_objects_for_user(user, perms, klass=None, use_groups=True, any_perm=Fals
         raise WrongAppError("Cannot determine content type")
     else:
         queryset = _get_queryset(klass)
-        if ctype.model_class() != queryset.model:
+        if ctype != get_content_type(queryset.model):
             raise MixedContentTypeError("Content type for given perms and "
                                         "klass differs")
 
@@ -746,7 +755,7 @@ def get_objects_for_group(group, perms, klass=None, any_perm=False, accept_globa
         raise WrongAppError("Cannot determine content type")
     else:
         queryset = _get_queryset(klass)
-        if ctype.model_class() != queryset.model:
+        if ctype != get_content_type(queryset.model):
             raise MixedContentTypeError("Content type for given perms and "
                                         "klass differs")
 
@@ -806,6 +815,62 @@ def get_objects_for_group(group, perms, klass=None, any_perm=False, accept_globa
     return queryset.filter(pk__in=values)
 
 
+def reassign_user_perms(old_user, new_user):
+    """
+    Reassigns all permissions from one user to another.
+
+    :param old_user: User instance from which permissions will be reassigned.
+    :param new_user: User instance to which permissions will be reassigned.
+    """
+    subclasses = set()
+    new_gen = {UserObjectPermissionBase}
+    while new_gen:
+        subclasses.update(new_gen)
+        new_gen = {sc for k in new_gen for sc in k.__subclasses__()}
+    for klass in subclasses:
+        if not klass._meta.abstract:
+            _reassign_perm_for_klass(klass, old_user, new_user)
+
+
+def _reassign_perm_for_klass(klass, old_user, new_user):
+    """
+    Helper function to reassign permissions for a specific model class.
+    """
+    if klass in [UserObjectPermission]:
+        user_objects_permission_qs = UserObjectPermission.objects.filter(user=old_user)
+        user_objects_permission_qs.update(user=new_user)
+    else:
+        both_user_perms = klass.objects.filter(user__in=[old_user, new_user])
+        if both_user_perms:
+            # Finding the duplicate perms to delete them to 
+            # prevent integrity constraint from raising on update. 
+            # Look Before Leap approach is not compatible with MySQL8
+            duplicate_perms = (
+                both_user_perms.values("permission", "content_object")
+                .annotate(id_c=Count("id"))
+                .filter(id_c__gt=1)
+            )
+            q = Q()
+            for duplicate_perm in duplicate_perms:
+                q |= Q(permission=duplicate_perm["permission"]) & Q(
+                    content_object=duplicate_perm["content_object"]
+                )
+            both_user_perms.filter(user=old_user).filter(q).delete()
+            both_user_perms.update(user=new_user)
+
+
+def filter_perms_queryset_by_objects(perms_queryset, objects):
+    if not isinstance(objects, QuerySet):
+        return perms_queryset
+    else:
+        field = 'content_object__pk'
+        if perms_queryset.model.objects.is_generic():
+            field = 'object_pk'
+        return perms_queryset.filter(
+            **{'{}__in'.format(field): objects.values_list(
+                'pk', flat=True).distinct().order_by()})
+
+
 def _handle_pk_field(queryset):
     pk = queryset.model._meta.pk
 
@@ -836,14 +901,3 @@ def _handle_pk_field(queryset):
         )
 
     return None
-
-def filter_perms_queryset_by_objects(perms_queryset, objects):
-    if not isinstance(objects, QuerySet):
-        return perms_queryset
-    else:
-        field = 'content_object__pk'
-        if perms_queryset.model.objects.is_generic():
-            field = 'object_pk'
-        return perms_queryset.filter(
-            **{'{}__in'.format(field): objects.values_list(
-                'pk', flat=True).distinct().order_by()})

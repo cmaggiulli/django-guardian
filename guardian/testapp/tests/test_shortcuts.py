@@ -1342,3 +1342,19 @@ class GetObjectsForGroup(TestCase):
     def test_exception_different_ctypes(self):
         self.assertRaises(MixedContentTypeError, get_objects_for_group,
                           self.group1, ['auth.change_permission', 'auth.change_group'])
+
+    def test_reassign_user_perms(self):
+        # Setup users and assign permissions to old_user
+        old_user = User.objects.create(username='old_user')
+        new_user = User.objects.create(username='new_user')
+        obj1 = ContentType.objects.create(
+            model='foo', app_label='guardian-tests')
+        assign_perm('change_contenttype', old_user, obj1)
+
+        # Reassign permissions from old_user to new_user
+        reassign_user_perms(old_user, new_user)
+
+        # Check that old_user no longer has permissions and new_user has permissions
+        self.assertFalse(old_user.has_perm('change_contenttype', obj1))
+        self.assertTrue(new_user.has_perm('change_contenttype', obj1))
+        
